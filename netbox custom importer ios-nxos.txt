@@ -46,6 +46,39 @@ def normalize_slug(slug):
     return str(slug).lower().replace("-", "").replace("_", "").strip()
 
 # ==========================================================
+# INTERFACE NAME NORMALIZATION (Bug 1 Fix)
+# ==========================================================
+def normalize_interface_name(name):
+    """Normalize Cisco interface abbreviations to canonical full names."""
+    if not name:
+        return ""
+    
+    name = name.strip()
+    
+    MAPPING = {
+        r'^(gigabitethernet|gigabit|gig|gi)': 'GigabitEthernet',
+        r'^(tengigabitethernet|tengigabit|teng|ten|te)': 'TenGigabitEthernet',
+        r'^(twentyfivegigabitethernet|twentyfivegigabit|twentyfiveg|tw)': 'TwentyFiveGigabitEthernet',
+        r'^(fortygigabitethernet|fortygigabit|fortyg|fo)': 'FortyGigabitEthernet',
+        r'^(hundredgigabitethernet|hundredgigabit|hundredg|hu)': 'HundredGigabitEthernet',
+        r'^(fastethernet|fast|fa)': 'FastEthernet',
+        r'^(ethernet|eth)': 'Ethernet',
+        r'^(port-channel|po)': 'Port-channel',
+        r'^(vlan|vl)': 'Vlan',
+        r'^(loopback|lo)': 'Loopback',
+        r'^(mgmt-ethernet|management|mgmt)': 'mgmt',
+        r'^(me)': 'Management',
+    }
+    
+    for pattern, canonical in MAPPING.items():
+        match = re.match(pattern, name, re.IGNORECASE)
+        if match:
+            suffix = name[match.end():].strip()
+            return f"{canonical}{suffix}"
+            
+    return name
+
+# ==========================================================
 # DRIVER FACTORY 
 # ==========================================================
 def get_driver(platform_slug, ip, username, password):
@@ -120,7 +153,7 @@ def classify_interface_type_by_speed(name, speed_str):
     # Check Mgmt interfaces
     elif name_lower.startswith("mgmt") or name_lower.startswith("me"):
         return "1000base-t"
-        
+    
     # Check subinterface parent-child relationship (if there is a dot, it's virtual)
     if "." in name_lower:
         return "virtual"
@@ -147,8 +180,19 @@ def classify_interface_type_by_speed(name, speed_str):
 
 
 # ==========================================================
-# INTERFACE TYPE RECONCILIATION GUARD
+# INTERFACE TYPE RECONCILIATION GUARD (Bug 2 Fix)
 # ==========================================================
+TYPE_SPEED_RANK = {
+    "": 0,
+    "other": 0,
+    "100base-tx": 1,
+    "1000base-t": 2,
+    "10gbase-x-sfpp": 3,
+    "25gbase-x-sfp28": 4,
+    "40gbase-x-qsfpp": 5,
+    "100gbase-x-cxp": 6
+}
+
 def should_update_type(current_type, correct_type):
     """Determine if an interface type should be updated in NetBox, safeguarding optical/LAG/virtual types."""
     if not correct_type:
@@ -160,6 +204,12 @@ def should_update_type(current_type, correct_type):
     if curr == corr:
         return False
     if curr in ("virtual", "lag"):
+        return False
+        
+    # Prevent speed demotions (e.g. from 10G to 1G fallback when port is down)
+    curr_rank = TYPE_SPEED_RANK.get(curr, 0)
+    corr_rank = TYPE_SPEED_RANK.get(corr, 0)
+    if curr_rank > corr_rank:
         return False
         
     GENERIC_TYPES = {
@@ -392,7 +442,7 @@ def get_admin_state_from_brief(status_str, platform_slug):
         if "admin-up" in status_lower:
             return True
     else:
-        if "administratively down" in status_lower or "admin" in status_lower:
+        if "administratively down" in status_lower:
             return False
             
     return True
@@ -411,8 +461,6 @@ class DeviceCollector(ABC):
     def collect_interface_details(self):
         """Collect interface speed, duplex, description, MTU, status"""
         pass
-    
-
     
     @abstractmethod
     def collect_inventory(self):
@@ -440,6 +488,8 @@ class IOSXECollector(DeviceCollector):
             for intf in output:
                 name = intf.get("interface", "")
                 if name:
+                    # Normalize interface name key (Bug 1 Fix)
+                    name_norm = normalize_interface_name(name)
                     try:
                         mtu_val = int(intf.get("mtu", 1500))
                     except (ValueError, TypeError):
@@ -449,7 +499,7 @@ class IOSXECollector(DeviceCollector):
                     link_status = intf.get("link_status", "").lower()
                     enabled_val = "administratively down" not in link_status and "admin" not in link_status
                         
-                    interfaces[name] = {
+                    interfaces[name_norm] = {
                         "description": intf.get("description", ""),
                         "mtu": mtu_val,
                         "state": intf.get("protocol_status", "down").lower(),
@@ -461,14 +511,16 @@ class IOSXECollector(DeviceCollector):
             if isinstance(status, list):
                 for intf in status:
                     name = intf.get("port", "")
-                    if name in interfaces:
+                    # Normalize interface name key (Bug 1 Fix)
+                    name_norm = normalize_interface_name(name)
+                    if name_norm in interfaces:
                         status_val = intf.get("status", "").lower()
                         is_disabled = "disabled" in status_val and "err-disabled" not in status_val
-                        interfaces[name].update({
+                        interfaces[name_norm].update({
                             "speed": intf.get("speed", ""),
                             "duplex": intf.get("duplex", ""),
                             "type": intf.get("type", ""),
-                            "enabled": not is_disabled if status_val else interfaces[name]["enabled"]
+                            "enabled": not is_disabled if status_val else interfaces[name_norm]["enabled"]
                         })
             
             logger.debug(f"[{self.device_name}] Collected {len(interfaces)} interface details")
@@ -545,12 +597,14 @@ class NXOSCollector(DeviceCollector):
             for intf in output:
                 name = intf.get("interface", "")
                 if name:
+                    # Normalize interface name key (Bug 1 Fix)
+                    name_norm = normalize_interface_name(name)
                     try:
                         mtu_val = int(intf.get("mtu", 1500))
                     except (ValueError, TypeError):
                         mtu_val = 1500
                         
-                    interfaces[name] = {
+                    interfaces[name_norm] = {
                         "description": intf.get("description", ""),
                         "mtu": mtu_val,
                         "state": intf.get("state", "down").lower(),
@@ -660,10 +714,10 @@ def validate_ip(ip_addr):
         return False
 
 # ==========================================================
-# IP SUBNET PREFIX LOOKUP
+# IP SUBNET PREFIX LOOKUP (N+1 Query Reduction - Bug 3 Fix)
 # ==========================================================
 def infer_subnet_mask(nb, ip_only, prefix_cache=None):
-    """Query NetBox prefixes to find the parent subnet prefix and infer the mask (with thread subnet cache)"""
+    """Query NetBox prefixes to find the parent subnet prefix and infer the mask (utilizes global pre-loaded cache)"""
     if prefix_cache is not None:
         try:
             ip_obj = ipaddress.ip_address(ip_only)
@@ -701,7 +755,7 @@ def infer_subnet_mask(nb, ip_only, prefix_cache=None):
 # IP ASSIGNMENT
 # ==========================================================
 def assign_ip(nb, ip_addr, interface, prefix_cache=None):
-    """Assign IP to interface with robust prefix handling and existing-check (with thread subnet cache)"""
+    """Assign IP to interface with robust prefix handling and existing-check (utilizes global prefix cache)"""
     ip_only = ip_addr.split('/')[0]
     if not validate_ip(ip_only):
         logger.error(f"[IP] Invalid IP address format: {ip_addr}")
@@ -776,7 +830,7 @@ def enrich_interface_in_netbox(nb, interface, interface_details):
         if interface.enabled != enabled_val:
             updates["enabled"] = enabled_val
             
-        # Check and update physical interface type if it changed (e.g. from 1000base-t fallback to correct speed-specific type)
+        # Check and update physical interface type if it changed (safeguards optical types)
         current_type = ""
         if interface.type:
             current_type = getattr(interface.type, "value", str(interface.type)) or ""
@@ -802,7 +856,7 @@ def enrich_interface_in_netbox(nb, interface, interface_details):
 # ==========================================================
 # DEVICE WORKER (Thread-safe & Session-isolated)
 # ==========================================================
-def process_single_device(nb, device_dict, ssh_user, ssh_pass):
+def process_single_device(nb, device_dict, ssh_user, ssh_pass, prefix_cache=None):
     """Thread worker utilizing shared NetBox API client to optimize connection efficiency"""
     device_name = device_dict["name"]
     device_id = device_dict["id"]
@@ -838,7 +892,9 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass):
     interface_details = {}
     inventory = {}
     software_info = {}
-    prefix_cache = {}  # Thread-local subnet cache to prevent sequential NetBox API lookups
+    
+    # Bug 3 Fix: Create thread-local copy of prefix_cache to prevent concurrent write race conditions
+    prefix_cache = dict(prefix_cache) if prefix_cache else {}
 
     # Core retry block wrapping BOTH connection instantiation (get_driver) and command execution
     for attempt in range(SSH_RETRIES):
@@ -964,22 +1020,31 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass):
             for mod in inventory.get("modules", []):
                 items_to_sync.append({
                     "name": mod.get("name") or f"Module {mod.get('pid')}",
-                    "pid": mod.get("pid") or "",
-                    "sn": mod.get("sn") or "",
+                    "part_id": mod.get("pid") or "",
+                    "serial": mod.get("sn") or "",
                     "label": "Module"
                 })
             for xcvr in inventory.get("transceivers", []):
+                # Ensure the interface prefix inside transceiver descriptions is fully normalized
+                raw_xcvr_name = xcvr.get("name") or ""
+                name_parts = raw_xcvr_name.split()
+                if name_parts and name_parts[0]:
+                    norm_intf_part = normalize_interface_name(name_parts[0])
+                    xcvr_name = f"{norm_intf_part} {' '.join(name_parts[1:])}".strip()
+                else:
+                    xcvr_name = raw_xcvr_name or f"Transceiver {xcvr.get('pid')}"
+
                 items_to_sync.append({
-                    "name": xcvr.get("name") or f"Transceiver {xcvr.get('pid')}",
-                    "pid": xcvr.get("pid") or "",
-                    "sn": xcvr.get("sn") or "",
+                    "name": xcvr_name,
+                    "part_id": xcvr.get("pid") or "",
+                    "serial": xcvr.get("sn") or "",
                     "label": "Transceiver"
                 })
                 
             for item_data in items_to_sync:
                 item_name = item_data["name"]
-                pid = item_data["pid"]
-                sn = item_data["sn"]
+                pid = item_data["part_id"]
+                sn = item_data["serial"]
                 label = item_data["label"]
                 
                 if item_name in existing_items:
@@ -1024,18 +1089,25 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass):
         result["error"] = "NetBox query failed"
         return result
 
-    # 4. Separate main interfaces and subinterfaces
-    # Combine entries from show ip interface brief (output) and show interfaces (interface_details)
-    brief_by_name = {intf.get("interface"): intf for intf in output if intf.get("interface")}
+    # 4. Normalize and Separate main interfaces and subinterfaces (Bug 1 Fix)
+    # Ensure all interface keys mapped from CLI output are fully canonicalized
+    brief_by_name = {}
+    for intf in output:
+        raw_name = intf.get("interface")
+        if raw_name:
+            norm_name = normalize_interface_name(raw_name)
+            intf["interface"] = norm_name  # Canonicalize name reference
+            brief_by_name[norm_name] = intf
     
     if interface_details:
         for name, details in interface_details.items():
-            if name not in brief_by_name:
+            name_norm = normalize_interface_name(name)
+            if name_norm not in brief_by_name:
                 # Include interfaces without IP addresses if they are operationally up (up/up)
                 is_up = details.get("state", "down").lower() == "up"
                 if is_up:
-                    brief_by_name[name] = {
-                        "interface": name,
+                    brief_by_name[name_norm] = {
+                        "interface": name_norm,
                         "ipaddr": None,
                         "status": "up"
                     }
@@ -1060,7 +1132,7 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass):
             # Determine administrative state from brief status column as default fallback
             brief_admin_enabled = get_admin_state_from_brief(status_col, platform_slug)
             
-            # Check if interface already exists in NetBox
+            # Check if interface already exists in NetBox using canonical name
             if name in existing:
                 netbox_intf = existing[name]
                 logger.debug(f"[{device_name}] Interface {name} already exists in NetBox, checking updates")
@@ -1281,6 +1353,21 @@ def main():
     except Exception as e:
         logger.warning(f"Initial single-device validation encountered a non-authentication connection issue: {e}. Proceeding with threading.")
 
+    # Bug 3 Fix: Pre-load prefixes globally to avoid sequential sequential N+1 lookups in threads
+    global_prefix_cache = {}
+    try:
+        logger.info("Pre-loading subnet prefixes from NetBox for optimal performance...")
+        all_prefixes = list(nb.ipam.prefixes.all())
+        for p in all_prefixes:
+            try:
+                net_obj = ipaddress.ip_network(p.prefix.prefix, strict=False)
+                global_prefix_cache[net_obj] = p.prefix.prefixlen
+            except ValueError:
+                pass
+        logger.info(f"Successfully cached {len(global_prefix_cache)} subnet prefixes from NetBox.")
+    except Exception as e:
+        logger.warning(f"Failed to pre-load subnet prefixes from NetBox (will fallback to sequential lookups): {e}")
+
     logger.info(f"Processing {len(device_list)} devices utilizing {MAX_WORKERS} concurrent threads")
 
     results_summary = []
@@ -1288,7 +1375,7 @@ def main():
     # Thread Pool Concurrency Execution
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [
-            executor.submit(process_single_device, nb, d, ssh_user, ssh_pass)
+            executor.submit(process_single_device, nb, d, ssh_user, ssh_pass, global_prefix_cache)
             for d in device_list
         ]
         
