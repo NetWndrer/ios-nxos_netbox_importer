@@ -97,8 +97,15 @@ def get_driver(platform_slug, ip, username, password):
         host=ip,
         username=username,
         password=password,
-        conn_timeout=SSH_TIMEOUT,
+        # Increased timeout to handle slow TACACS authentication
+        conn_timeout=60, 
+        # Timeout for the authentication process itself
+        auth_timeout=60,  
+        # Time to wait for the banner before sending username
+        banner_timeout=60,
+        # Maintain read timeout for subsequent command outputs
         read_timeout=SSH_READ_TIMEOUT,
+        # Keep this for responsiveness after connection
         global_delay_factor=1.5
     )
 
