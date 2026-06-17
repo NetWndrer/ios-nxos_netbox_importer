@@ -83,16 +83,17 @@ def normalize_interface_name(name):
 # ==========================================================
 def get_driver(platform_slug, ip, username, password):
     """Create Netmiko connection handler based on platform"""
+    slug_lower = str(platform_slug or "").lower().strip()
     norm = normalize_slug(platform_slug)
     
-    if "iosxe" in norm or "ios" in norm:
+    if slug_lower in ("ios-xe", "iosxe") or "iosxe" in norm or "ios" in norm:
         device_type = 'cisco_ios'
-    elif "nxos" in norm:
+    elif slug_lower in ("nx-os", "nxos") or "nxos" in norm:
         device_type = 'cisco_nxos'
     else:
         raise ValueError(f"Unsupported platform: {platform_slug}")
     
-    return ConnectHandler(
+    conn = ConnectHandler(
         device_type=device_type,
         host=ip,
         username=username,
@@ -103,11 +104,12 @@ def get_driver(platform_slug, ip, username, password):
         auth_timeout=60,  
         # Time to wait for the banner before sending username
         banner_timeout=60,
-        # Maintain read timeout for subsequent command outputs
-        read_timeout=SSH_READ_TIMEOUT,
         # Keep this for responsiveness after connection
         global_delay_factor=1.5
     )
+    # Set read_timeout on the connection object for Netmiko 4.x compatibility
+    conn.read_timeout = SSH_READ_TIMEOUT
+    return conn
 
 # ==========================================================
 # INTERFACE TYPE CLASSIFICATION
@@ -441,9 +443,10 @@ def get_admin_state_from_brief(status_str, platform_slug):
     if not status_str:
         return True
     status_lower = str(status_str).lower()
+    slug_lower = str(platform_slug or "").lower().strip()
     norm = normalize_slug(platform_slug)
     
-    if "nxos" in norm:
+    if slug_lower in ("nx-os", "nxos") or "nxos" in norm:
         if "admin-down" in status_lower:
             return False
         if "admin-up" in status_lower:
@@ -883,10 +886,11 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass, prefix_cache=None
     logger.info(f"[{device_name}] Starting sync on {device_ip} ({platform_slug})")
 
     # Select collector class mapping
+    slug_lower = str(platform_slug or "").lower().strip()
     norm_platform = normalize_slug(platform_slug)
-    if "iosxe" in norm_platform or "ios" in norm_platform:
+    if slug_lower in ("ios-xe", "iosxe") or "iosxe" in norm_platform or "ios" in norm_platform:
         collector_class = IOSXECollector
-    elif "nxos" in norm_platform:
+    elif slug_lower in ("nx-os", "nxos") or "nxos" in norm_platform:
         collector_class = NXOSCollector
     else:
         logger.warning(f"[{device_name}] No collector implemented for platform: {platform_slug}")
@@ -1281,14 +1285,16 @@ def main():
     role_filter = os.getenv("NETBOX_ROLE", "").strip()
     tag_filter = os.getenv("NETBOX_TAG", "").strip()
     device_filter = os.getenv("NETBOX_DEVICE", "").strip()
+    device_type_filter = os.getenv("NETBOX_DEVICE_TYPE", "").strip()
 
-    if not any([site_filter, role_filter, tag_filter, device_filter]):
+    if not any([site_filter, role_filter, tag_filter, device_filter, device_type_filter]):
         print("\nOptional Targeting Filters (Leave blank and press Enter to skip):")
         device_filter = input("Device Name Filter: ").strip()
         if not device_filter:
             site_filter = input("Site Slug Filter: ").strip()
             role_filter = input("Role Slug Filter: ").strip()
             tag_filter = input("Tag Slug Filter: ").strip()
+            device_type_filter = input("Device Type Slug Filter: ").strip()
 
     logger.info(f"Connecting to NetBox at {NETBOX_URL} (SSL verify: {VERIFY_SSL})")
     if DRY_RUN:
@@ -1314,6 +1320,8 @@ def main():
             filter_params["role"] = role_filter
         if tag_filter:
             filter_params["tag"] = tag_filter
+        if device_type_filter:
+            filter_params["device_type"] = device_type_filter
             
         logger.info(f"Querying NetBox with parameters: {filter_params}")
         devices = nb.dcim.devices.filter(**filter_params)
