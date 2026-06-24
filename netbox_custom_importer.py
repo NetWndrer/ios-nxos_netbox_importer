@@ -58,9 +58,9 @@ def normalize_interface_name(name):
     MAPPING = {
         r'^(gigabitethernet|gigabit|gig|gi)': 'GigabitEthernet',
         r'^(tengigabitethernet|tengigabit|teng|ten|te)': 'TenGigabitEthernet',
-        r'^(twentyfivegigabitethernet|twentyfivegigabit|twentyfiveg|tw)': 'TwentyFiveGigabitEthernet',
+        r'^(twentyfivegigabitethernet|twentyfivegigabit|twentyfivegige|twentyfivegig|twentyfiveg|tw)': 'TwentyFiveGigabitEthernet',
         r'^(fortygigabitethernet|fortygigabit|fortyg|fo)': 'FortyGigabitEthernet',
-        r'^(hundredgigabitethernet|hundredgigabit|hundredg|hu)': 'HundredGigabitEthernet',
+        r'^(hundredgigabitethernet|hundredgigabit|hundredgige|hundredgig|hundredg|hu)': 'HundredGigabitEthernet',
         r'^(fastethernet|fast|fa)': 'FastEthernet',
         r'^(ethernet|eth)': 'Ethernet',
         r'^(port-channel|po)': 'Port-channel',
@@ -186,6 +186,35 @@ def classify_interface_type_by_speed(name, speed_str):
 
     # Fallback to name-based classification (with Nexus heuristics)
     return classify_interface_type(name)
+
+
+# ==========================================================
+# MANAGEMENT AND LOGICAL INTERFACE CHECK
+# ==========================================================
+def is_management_or_logical_interface(name):
+    """Check if an interface is a logical/virtual interface or a dedicated management port."""
+    if not name:
+        return False
+    name_lower = name.lower()
+    
+    # Virtual / logical prefixes
+    logical_prefixes = ("vlan", "port-channel", "loopback", "tunnel", "null", "virtual", "po", "vl", "lo", "tu", "nu")
+    if name_lower.startswith(logical_prefixes):
+        return True
+        
+    # Dedicated management port patterns
+    if name_lower.startswith(("mgmt", "management", "gigabitethernet0/0", "gigabitethernet0")):
+        return True
+        
+    # me interface followed by digit or slash (e.g., me0, me1, me/0)
+    if name_lower.startswith("me") and (len(name_lower) == 2 or name_lower[2].isdigit() or name_lower[2] == "/"):
+        return True
+        
+    # Subinterfaces (e.g., GigabitEthernet1/0/1.100) are logical/virtual
+    if "." in name_lower:
+        return True
+        
+    return False
 
 
 # ==========================================================
@@ -516,13 +545,18 @@ class IOSXECollector(DeviceCollector):
                         "enabled": enabled_val,
                     }
             
-            # get speed/duplex
+            # get speed/duplex and track present status ports to filter phantom expansion interfaces
+            status_ports = set()
+            has_status_info = False
             status = self.conn.send_command("show interfaces status", use_textfsm=True)
-            if isinstance(status, list):
+            if isinstance(status, list) and len(status) > 0:
+                has_status_info = True
                 for intf in status:
                     name = intf.get("port", "")
                     # Normalize interface name key (Bug 1 Fix)
                     name_norm = normalize_interface_name(name)
+                    if name_norm:
+                        status_ports.add(name_norm)
                     if name_norm in interfaces:
                         status_val = intf.get("status", "").lower()
                         is_disabled = "disabled" in status_val and "err-disabled" not in status_val
@@ -532,6 +566,28 @@ class IOSXECollector(DeviceCollector):
                             "type": intf.get("type", ""),
                             "enabled": not is_disabled if status_val else interfaces[name_norm]["enabled"]
                         })
+            
+            # Filter out phantom expansion/modular interfaces on IOS-XE switches
+            if has_status_info:
+                physical_prefixes = (
+                    "GigabitEthernet",
+                    "TenGigabitEthernet",
+                    "TwentyFiveGigabitEthernet",
+                    "FortyGigabitEthernet",
+                    "HundredGigabitEthernet",
+                    "FastEthernet",
+                    "Ethernet"
+                )
+                filtered_interfaces = {}
+                for name, details in interfaces.items():
+                    # If it is a physical Ethernet interface, it must exist in show interfaces status,
+                    # unless it is an OOB management interface or logical interface.
+                    if name.startswith(physical_prefixes):
+                        if name not in status_ports and not is_management_or_logical_interface(name):
+                            logger.info(f"[{self.device_name}] Filtering out phantom interface: {name}")
+                            continue
+                    filtered_interfaces[name] = details
+                interfaces = filtered_interfaces
             
             logger.debug(f"[{self.device_name}] Collected {len(interfaces)} interface details")
             return interfaces
@@ -1122,6 +1178,28 @@ def process_single_device(nb, device_dict, ssh_user, ssh_pass, prefix_cache=None
                         "ipaddr": None,
                         "status": "up"
                     }
+                    
+    # Filter out phantom interfaces from the sync list (brief_by_name)
+    if interface_details:
+        physical_prefixes = (
+            "GigabitEthernet",
+            "TenGigabitEthernet",
+            "TwentyFiveGigabitEthernet",
+            "FortyGigabitEthernet",
+            "HundredGigabitEthernet",
+            "FastEthernet",
+            "Ethernet"
+        )
+        filtered_brief = {}
+        for name, intf in brief_by_name.items():
+            # If it is a physical Ethernet interface, it must exist in interface_details to be synchronized,
+            # unless it is an OOB management interface or logical/virtual interface.
+            if name.startswith(physical_prefixes):
+                if name not in interface_details and not is_management_or_logical_interface(name):
+                    logger.info(f"[{device_name}] Skipping sync for phantom interface: {name}")
+                    continue
+            filtered_brief[name] = intf
+        brief_by_name = filtered_brief
                     
     parent_interfaces = []
     subinterfaces = []
